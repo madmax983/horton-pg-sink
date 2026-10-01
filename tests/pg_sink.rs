@@ -1,0 +1,218 @@
+//! End-to-end: horton (in-memory device) -> archive_plan -> COPY ->
+//! upsert + watermark -> archive_commit.
+//!
+//! Needs a live Postgres. URL comes from `HORTON_PG_SINK_URL`, defaulting
+//! to the local unix socket as the current OS user:
+//! `host=/var/run/postgresql dbname=postgres`.
+
+use std::sync::Mutex;
+
+use horton::{Config, Db};
+use horton_pg_sink::PgSink;
+use horton_pg_sink::device::MemDevice;
+use horton_pg_sink::mappers::HarvestEventMapper;
+
+/// The two tests share one Postgres; serialize them.
+static PG_LOCK: Mutex<()> = Mutex::new(());
+
+type SinkDb = Db<MemDevice<4096>, 4096, 32, 2048, 64, 65536, 4, 4, 256, 0>;
+
+fn pg_url() -> String {
+    std::env::var("HORTON_PG_SINK_URL")
+        .unwrap_or_else(|_| "host=/var/run/postgresql dbname=postgres".to_string())
+}
+
+fn test_config() -> Config {
+    // WAL [8, 520): 512 blocks, comfortably more than the puts between
+    // flushes (the WAL only wraps when full at flush time). Tables
+    // [520, 4224); manifests at 0 and 4.
+    Config::new(8, 520, 520, 4224, 0, 4)
+}
+
+fn target_for(test: &str) -> String {
+    format!("sink_test_events_{test}")
+}
+
+async fn connect(target: &str) -> PgSink<HarvestEventMapper> {
+    let mapper = HarvestEventMapper::new(target);
+    let sink = PgSink::connect(&pg_url(), mapper)
+        .await
+        .expect("connect to Postgres");
+    sink.ensure_schema().await.expect("watermark table");
+    sink.client_exec(&format!("DROP TABLE IF EXISTS {target}"), &[])
+        .await
+        .expect("drop target");
+    sink.client_exec(
+        &format!(
+            "CREATE TABLE {target} (\
+           id               BIGSERIAL PRIMARY KEY,\
+           workflow_exec_id UUID NOT NULL,\
+           event_id         INT NOT NULL,\
+           event_type       TEXT NOT NULL,\
+           event_data       JSONB NOT NULL,\
+           timestamp        TIMESTAMPTZ NOT NULL,\
+           UNIQUE (workflow_exec_id, event_id)\
+         )"
+        ),
+        &[],
+    )
+    .await
+    .expect("create target");
+    sink.client_exec("TRUNCATE horton_pg_sink_flushed", &[])
+        .await
+        .expect("clear watermark");
+    sink
+}
+
+fn uuid_bytes(seed: u8) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    for (i, b) in id.iter_mut().enumerate() {
+        *b = seed.wrapping_add(i as u8);
+    }
+    id
+}
+
+/// 3 workflows x 60 events, flushed in 4 batches -> 4 sealed tables.
+async fn build_db() -> SinkDb {
+    let mut db = SinkDb::new(MemDevice::new(), test_config());
+    db.open().await.expect("open");
+    let mut n = 0;
+    for w in 0..3u8 {
+        let wf = uuid_bytes(w);
+        for e in 0..60u32 {
+            let (k, v) = HarvestEventMapper::encode(
+                &wf,
+                e,
+                "ActivityCompleted",
+                "2026-09-30T12:00:00Z",
+                &format!(r#"{{"w":{w},"e":{e}}}"#),
+            )
+            .unwrap();
+            db.put(&k, &v).await.expect("put");
+            n += 1;
+            if n % 45 == 0 {
+                db.flush().await.expect("flush");
+            }
+        }
+    }
+    db.flush().await.expect("final flush");
+    db
+}
+
+fn table_ids(db: &SinkDb) -> Vec<u32> {
+    db.level_tables(0)
+        .expect("level 0")
+        .iter()
+        .map(|t| t.id)
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the lock only serializes the two PG tests
+async fn archive_to_postgres_end_to_end() {
+    let _guard = PG_LOCK.lock().unwrap();
+    let target = target_for("e2e");
+    let mut sink = connect(&target).await;
+    let count_sql = format!("SELECT count(*) FROM {target}");
+    let mut db = build_db().await;
+    let ids = table_ids(&db);
+    assert!(!ids.is_empty(), "expected sealed tables in L0");
+
+    let mut total_copied = 0u64;
+    for id in &ids {
+        let rep = sink.sink_table(&mut db, 0, *id).await.expect("sink table");
+        assert!(rep.uploaded, "first run must COPY");
+        assert!(rep.committed, "first run must archive-commit");
+        assert!(rep.entries_copied > 0);
+        total_copied += rep.entries_copied;
+    }
+    assert_eq!(total_copied, 180, "3 workflows x 60 events");
+
+    // All rows landed, keyed idempotently.
+    let rows: i64 = sink
+        .client_query_one(&count_sql, &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 180);
+
+    // Spot-check one row's decoded fields.
+    let wf0 = HarvestEventMapper::fmt_uuid(&uuid_bytes(0));
+    let row = sink
+        .client_query_one(
+            &format!(
+                "SELECT event_type, (event_data = '{{\"w\":0,\"e\":7}}'::jsonb) AS data_ok \
+                 FROM {target} WHERE workflow_exec_id::text = $1 AND event_id = 7"
+            ),
+            &[&wf0],
+        )
+        .await
+        .expect("spot check");
+    let et: String = row.get(0);
+    let data_ok: bool = row.get(1);
+    assert_eq!(et, "ActivityCompleted");
+    assert!(data_ok, "event_data jsonb mismatch");
+
+    // Tables are gone locally.
+    for id in &ids {
+        assert!(db.archive_plan(0, *id).is_none(), "table {id} forgotten");
+    }
+
+    // Re-sinking is a no-op success (watermark replay): no duplicates,
+    // no error.
+    for id in &ids {
+        let rep = sink.sink_table(&mut db, 0, *id).await.expect("re-sink");
+        assert!(!rep.uploaded);
+        assert!(!rep.committed);
+    }
+    let rows: i64 = sink
+        .client_query_one(&count_sql, &[])
+        .await
+        .expect("count2")
+        .get(0);
+    assert_eq!(rows, 180, "no duplicates on replay");
+
+    // Unknown table id with no watermark is an error, not silent success.
+    assert!(sink.sink_table(&mut db, 0, 0xdead_beef).await.is_err());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the lock only serializes the two PG tests
+async fn crash_between_pg_commit_and_archive_commit_replays_cleanly() {
+    let _guard = PG_LOCK.lock().unwrap();
+    let target = target_for("crash");
+    let mut sink = connect(&target).await;
+    let mut db = build_db().await;
+    let ids = table_ids(&db);
+    let victim = ids[0];
+
+    // Simulate the crash: Postgres has the watermark, horton still holds
+    // the table (archive_commit never ran).
+    sink.client_exec(
+        "INSERT INTO horton_pg_sink_flushed (table_id, entries, max_seq) VALUES ($1, 45, 44)",
+        &[&(victim as i32)],
+    )
+    .await
+    .expect("fake watermark");
+    assert!(db.archive_plan(0, victim).is_some(), "table still local");
+
+    let rep = sink
+        .sink_table(&mut db, 0, victim)
+        .await
+        .expect("replay sink");
+    assert!(!rep.uploaded, "COPY must be skipped on watermark hit");
+    assert!(rep.committed, "archive_commit must still run");
+    assert!(db.archive_plan(0, victim).is_none());
+
+    // And the rows that *were* flushed by the real sink of the other
+    // tables are untouched.
+    for id in ids.iter().skip(1) {
+        sink.sink_table(&mut db, 0, *id).await.expect("sink rest");
+    }
+    let rows: i64 = sink
+        .client_query_one(&format!("SELECT count(*) FROM {target}"), &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 135, "only the 3 really-sunk tables landed");
+}

@@ -1,0 +1,20 @@
+[package]
+name = "horton-pg-sink"
+version = "0.1.0"
+edition = "2024"
+description = "Postgres sink for horton's archive API: sealed SSTables become batched COPY loads, Postgres stays the source of truth"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+horton = { path = "../horton" }
+tokio-postgres = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+[lib]
+name = "horton_pg_sink"
+path = "src/lib.rs"
