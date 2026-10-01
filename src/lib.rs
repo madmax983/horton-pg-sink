@@ -18,16 +18,29 @@
 //! 3. Otherwise the sink scans the database over
 //!    `[first_key, successor(last_key))` with `max_seq` pinned to the
 //!    table's `max_seq` and streams every entry through the
-//!    [`RowMapper`] into a temp staging table, then
+//!    [`RowMapper`] into a per-table temp staging table, then
 //!    `INSERT ... ON CONFLICT DO NOTHING` into the target. The scan is a
-//!    merged view, so entries from overlapping newer tables in the same
-//!    key range may ride along; the upsert makes that harmless, and
-//!    their own tables re-deliver them later anyway.
+//!    merged view, so entries from overlapping tables in the same key
+//!    range may ride along; the upsert makes that harmless, and the
+//!    merged view is the durable choice — if an older table's sink
+//!    failed, a newer table's scan carries its entries forward.
 //! 4. The watermark row and the upsert commit in one Postgres
 //!    transaction.
 //! 5. [`Db::archive_commit`] drops the table from horton's manifest.
 //!    The commit runs strictly after the Postgres commit, per the
 //!    archive docs: no crash can lose acknowledged data.
+//!
+//! # Backpressure
+//!
+//! [`PgSink::lag_report`] lists sealed tables with no watermark row —
+//! the sink's backlog. [`PgSink::set_shed_threshold`] arms load
+//! shedding: when the backlog reaches the threshold, `sink_table`
+//! returns [`SinkError::ShedLoad`] instead of sinking, so the caller
+//! can route writes straight to Postgres until the backlog drains.
+//!
+//! One horton database per Postgres database: watermarks are keyed by
+//! table id alone, and table ids are only unique within one horton
+//! database.
 //!
 //! The sink is correct for insert-only workloads (event logs, sensor
 //! streams). Tables carrying tombstones are refused by
@@ -38,6 +51,7 @@
 
 use bytes::Bytes;
 use futures_util::SinkExt;
+use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use tokio_postgres::types::ToSql;
 
@@ -119,6 +133,10 @@ pub enum SinkError {
     /// The table carries tombstones that would resurrect shadowed values
     /// if archived. Compact the table down first.
     TombstonesWouldResurrect { level: usize, table_id: u32 },
+    /// The sink shed its load: `pending` unsunk tables are waiting,
+    /// at or above the configured threshold. The caller should route
+    /// writes straight to Postgres until the backlog drains.
+    ShedLoad { pending: usize, threshold: usize },
     /// The mapper rejected an entry.
     Map(String),
     /// A horton operation failed.
@@ -139,6 +157,10 @@ impl core::fmt::Display for SinkError {
             Self::TombstonesWouldResurrect { level, table_id } => write!(
                 f,
                 "table {table_id} at level {level} hides values behind tombstones; compact first"
+            ),
+            Self::ShedLoad { pending, threshold } => write!(
+                f,
+                "shed load: {pending} tables waiting (threshold {threshold}); write straight to Postgres"
             ),
             Self::Map(msg) => write!(f, "row mapping failed: {msg}"),
             Self::Horton(msg) => write!(f, "horton error: {msg}"),
@@ -170,11 +192,39 @@ pub struct SinkReport {
     pub committed: bool,
 }
 
+/// Backlog of sealed tables still waiting for the sink (level 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LagReport {
+    /// Ids of sealed tables with no watermark row, oldest first.
+    pub tables: Vec<u32>,
+}
+
+impl LagReport {
+    /// Number of tables waiting.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// True when nothing is waiting.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+}
+
 /// Postgres sink for horton's archive API. See the [module](self) docs
 /// for the protocol.
+///
+/// The Postgres client sits behind an async mutex: `sink_table` takes
+/// `&self`, so the sink can be shared across tasks, and concurrent
+/// calls serialize on the client rather than corrupting each other's
+/// statements. The intended deployment is still one flusher task; the
+/// mutex makes concurrent use safe, not fast.
 pub struct PgSink<M> {
-    client: Client,
+    client: Mutex<Client>,
     mapper: M,
+    shed_threshold: Option<usize>,
 }
 
 impl<M: RowMapper> PgSink<M> {
@@ -185,12 +235,21 @@ impl<M: RowMapper> PgSink<M> {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok(Self { client, mapper })
+        Ok(Self {
+            client: Mutex::new(client),
+            mapper,
+            shed_threshold: None,
+        })
     }
 
     /// Create the watermark table if it is missing.
     pub async fn ensure_schema(&self) -> Result<(), SinkError> {
-        self.client
+        let client = self.client.lock().await;
+        Self::ensure_schema_on(&client).await
+    }
+
+    async fn ensure_schema_on(client: &Client) -> Result<(), SinkError> {
+        client
             .execute(
                 "CREATE TABLE IF NOT EXISTS horton_pg_sink_flushed (\
                    table_id   INTEGER PRIMARY KEY,\
@@ -210,7 +269,8 @@ impl<M: RowMapper> PgSink<M> {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<u64, SinkError> {
-        Ok(self.client.execute(sql, params).await?)
+        let client = self.client.lock().await;
+        Ok(client.execute(sql, params).await?)
     }
 
     /// Raw single-row query passthrough (test/support).
@@ -219,7 +279,72 @@ impl<M: RowMapper> PgSink<M> {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<tokio_postgres::Row, SinkError> {
-        Ok(self.client.query_one(sql, params).await?)
+        let client = self.client.lock().await;
+        Ok(client.query_one(sql, params).await?)
+    }
+
+    /// Set the load-shedding threshold: when [`Self::lag_report`]
+    /// shows at least this many tables waiting, [`Self::sink_table`]
+    /// refuses with [`SinkError::ShedLoad`] instead of sinking, so the
+    /// caller can route writes straight to Postgres until the backlog
+    /// drains. `None` (the default) never sheds.
+    pub fn set_shed_threshold(&mut self, threshold: Option<usize>) {
+        self.shed_threshold = threshold;
+    }
+
+    /// Tables sealed at `level` with no watermark row yet — the sink's
+    /// backlog, oldest first. Ensures the watermark table exists.
+    pub async fn lag_report<
+        D: BlockDevice,
+        const BLOCK: usize,
+        const KEY_MAX: usize,
+        const VAL_MAX: usize,
+        const CAP: usize,
+        const ARENA: usize,
+        const LEVELS: usize,
+        const TABLES: usize,
+        const BLOOM_BYTES: usize,
+        const CACHE: usize,
+    >(
+        &self,
+        db: &Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
+        level: usize,
+    ) -> Result<LagReport, SinkError> {
+        let client = self.client.lock().await;
+        Self::ensure_schema_on(&client).await?;
+        Self::lag_report_on(&client, db, level).await
+    }
+
+    async fn lag_report_on<
+        D: BlockDevice,
+        const BLOCK: usize,
+        const KEY_MAX: usize,
+        const VAL_MAX: usize,
+        const CAP: usize,
+        const ARENA: usize,
+        const LEVELS: usize,
+        const TABLES: usize,
+        const BLOOM_BYTES: usize,
+        const CACHE: usize,
+    >(
+        client: &Client,
+        db: &Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
+        level: usize,
+    ) -> Result<LagReport, SinkError> {
+        let mut pending: Vec<u32> = db
+            .level_tables(level)
+            .map(|ts| ts.iter().map(|t| t.id).collect())
+            .unwrap_or_default();
+        pending.sort_unstable();
+        if pending.is_empty() {
+            return Ok(LagReport { tables: pending });
+        }
+        let rows = client
+            .query("SELECT table_id FROM horton_pg_sink_flushed", &[])
+            .await?;
+        let done: std::collections::HashSet<i32> = rows.iter().map(|r| r.get(0)).collect();
+        pending.retain(|id| !done.contains(&(*id as i32)));
+        Ok(LagReport { tables: pending })
     }
 
     /// Sink one sealed table into Postgres, then archive-commit it.
@@ -228,6 +353,14 @@ impl<M: RowMapper> PgSink<M> {
     /// the `COPY` and goes straight to the commit; re-running a table
     /// that is already gone locally reports success without doing
     /// anything.
+    ///
+    /// Takes `&self`: the sink holds no mutable state, so it can be
+    /// shared across flusher tasks (each drives its own `Db`). The
+    /// staging table is named per table id, so concurrent sinks of
+    /// different tables never collide.
+    ///
+    /// When a shed threshold is set and the backlog reaches it, this
+    /// returns [`SinkError::ShedLoad`] without touching the table.
     #[allow(clippy::too_many_arguments)]
     pub async fn sink_table<
         D: BlockDevice,
@@ -241,7 +374,7 @@ impl<M: RowMapper> PgSink<M> {
         const BLOOM_BYTES: usize,
         const CACHE: usize,
     >(
-        &mut self,
+        &self,
         db: &mut Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
         level: usize,
         table_id: u32,
@@ -252,8 +385,8 @@ impl<M: RowMapper> PgSink<M> {
         let Some(plan) = db.archive_plan(level, table_id) else {
             // Table already gone locally: success iff the watermark proves
             // a previous run flushed it; otherwise the id is just wrong.
-            let row = self
-                .client
+            let client = self.client.lock().await;
+            let row = client
                 .query_opt(
                     "SELECT 1 FROM horton_pg_sink_flushed WHERE table_id = $1",
                     &[&(table_id as i32)],
@@ -272,25 +405,65 @@ impl<M: RowMapper> PgSink<M> {
         };
         let sealed = plan.sealed();
 
-        let already: Option<i32> = self
-            .client
-            .query_opt(
-                "SELECT table_id FROM horton_pg_sink_flushed WHERE table_id = $1",
-                &[&(table_id as i32)],
-            )
-            .await?
-            .map(|r| r.get(0));
+        // Fail fast on range tombstones: archive_commit would refuse
+        // the table anyway, so don't burn a COPY first. (Point
+        // tombstones are invisible to the scan and still surface as
+        // TombstonesWouldResurrect at commit time.)
+        if sealed.rdel_blocks > 0 {
+            return Err(SinkError::TombstonesWouldResurrect { level, table_id });
+        }
 
+        let already: Option<i32> = {
+            let client = self.client.lock().await;
+            client
+                .query_opt(
+                    "SELECT table_id FROM horton_pg_sink_flushed WHERE table_id = $1",
+                    &[&(table_id as i32)],
+                )
+                .await?
+                .map(|r| r.get(0))
+        };
+
+        // Load shedding: a cheap backlog check before the expensive
+        // COPY. Watermarked tables skip it — their commit is cheap.
+        if already.is_none()
+            && let Some(threshold) = self.shed_threshold
+        {
+            let client = self.client.lock().await;
+            let lag = Self::lag_report_on(&client, db, level).await?;
+            if lag.len() >= threshold {
+                return Err(SinkError::ShedLoad {
+                    pending: lag.len(),
+                    threshold,
+                });
+            }
+        }
+
+        // One staging table per table id: ids are never reused, so a
+        // leftover from a crashed run belongs to this same table and is
+        // safe to replace, and concurrent sinks never collide.
+        let staging = format!("pg_sink_staging_{table_id}");
         let mut entries_copied: u64 = 0;
         let uploaded: bool = if already.is_none() {
+            // The client lock is held across the whole upload: the COPY
+            // and the transaction must not interleave with another
+            // task's statements on this connection.
+            let mut client = self.client.lock().await;
             entries_copied = self
-                .copy_table(db, &sealed.first_key, &sealed.last_key, sealed.max_seq)
+                .copy_table(
+                    &client,
+                    db,
+                    &staging,
+                    &sealed.first_key,
+                    &sealed.last_key,
+                    sealed.max_seq,
+                )
                 .await?;
 
             // One transaction: the upsert + the watermark commit
             // atomically. The staging table was filled by the COPY above
             // and is dropped at the end of this call.
-            let tx = self.client.transaction().await?;
+            let tx = client.transaction().await?;
             let cols: Vec<String> = self
                 .mapper
                 .columns()
@@ -302,7 +475,7 @@ impl<M: RowMapper> PgSink<M> {
             let conflict = self.mapper.conflict_target();
             tx.execute(
                 &format!(
-                    "INSERT INTO {target} ({col_list}) SELECT {col_list} FROM pg_sink_staging \
+                    "INSERT INTO {target} ({col_list}) SELECT {col_list} FROM {staging} \
                      ON CONFLICT {conflict} DO NOTHING"
                 ),
                 &[],
@@ -319,8 +492,8 @@ impl<M: RowMapper> PgSink<M> {
             )
             .await?;
             tx.commit().await?;
-            self.client
-                .execute("DROP TABLE pg_sink_staging", &[])
+            client
+                .execute(&format!("DROP TABLE {staging}"), &[])
                 .await?;
             true
         } else {
@@ -370,7 +543,9 @@ impl<M: RowMapper> PgSink<M> {
         const CACHE: usize,
     >(
         &self,
+        client: &Client,
         db: &Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
+        staging: &str,
         first_key: &horton::KeyBound<KEY_MAX>,
         last_key: &horton::KeyBound<KEY_MAX>,
         max_seq: u64,
@@ -400,23 +575,21 @@ impl<M: RowMapper> PgSink<M> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Staging lives in this session only. A failed run may leave a
-        // previous staging table behind, so start from a clean slate.
-        let session = &self.client;
+        // The staging name is per table id (never reused), so a
+        // leftover from a crashed run belongs to this same table and is
+        // safe to replace; concurrent sinks use different names.
+        let session = client;
         session
-            .execute("DROP TABLE IF EXISTS pg_sink_staging", &[])
+            .execute(&format!("DROP TABLE IF EXISTS {staging}"), &[])
             .await?;
         session
-            .execute(
-                &format!("CREATE TEMP TABLE pg_sink_staging ({staging_ddl})"),
-                &[],
-            )
+            .execute(&format!("CREATE TEMP TABLE {staging} ({staging_ddl})"), &[])
             .await?;
         // Plain (non-transactional) COPY: a crash here leaves the temp
         // table behind for the session, and the watermark row absent, so
         // the next run replays from scratch — idempotent.
         let copy = session
-            .copy_in(&format!("COPY pg_sink_staging ({copy_cols}) FROM STDIN"))
+            .copy_in(&format!("COPY {staging} ({copy_cols}) FROM STDIN"))
             .await
             .map_err(SinkError::Postgres)?;
         futures_util::pin_mut!(copy);

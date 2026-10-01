@@ -61,25 +61,40 @@ export HORTON_PG_SINK_URL="host=/var/run/postgresql dbname=sinktest"
 cargo test
 ```
 
-Unit tests cover COPY-text escaping, the key codec, and the
-exclusive-end computation. Integration tests (real Postgres) cover the
-full archive → COPY → watermark → commit flow, watermark replay
-idempotency, the crash-between-commit-and-archive replay, and unknown
-table ids.
+Integration tests (real Postgres) cover the full archive → COPY →
+watermark → commit flow, watermark replay idempotency, the
+crash-between-commit-and-archive replay, unknown table ids, the lag
+gauge + load shedding, concurrent sinks sharing one sink, and the
+tombstone fail-fast.
+
+## Backpressure
+
+`sink.lag_report(&db, level)` lists sealed tables with no watermark
+row — the sink's backlog, oldest first. `sink.set_shed_threshold(n)`
+arms load shedding: when the backlog reaches `n`, `sink_table`
+returns `SinkError::ShedLoad` instead of sinking, so the caller can
+route writes straight to Postgres until the backlog drains.
+Watermarked replays are cheap and never shed.
 
 ## Honest gaps
 
-- **No backpressure signal.** If Postgres falls behind, horton's disk
-  grows. A lag gauge + "shed back to direct PG writes" watermark is the
-  missing ops piece.
-- **Single-writer.** `sink_table` takes `&mut self`; the intended
-  deployment is one flusher task owning the sink (which matches horton's
-  single `&mut Db` writer anyway).
+- **The scan re-reads overlapping ranges.** A dedicated per-table
+  iterator in horton (there is none public today) would make the COPY
+  strictly one-table; the upsert absorbs the overlap for now. The
+  merged scan is also the *durable* choice: if an older table's sink
+  failed, a newer table's scan carries its entries forward.
+- **One horton database per Postgres database.** Watermarks are keyed
+  by table id alone, and table ids are only unique within one horton
+  database. Two horton databases sinking into the same Postgres
+  database would collide on watermarks.
 - **WAL sizing is the operator's job.** The WAL only wraps when full at
   flush time — size the WAL region for puts-between-flushes (the test
   uses 512 blocks for 45 puts/flush).
 - **No deletes.** Insert-only by design; tombstone-bearing tables are
-  refused, not handled.
-- **The scan re-reads overlapping ranges.** A dedicated per-table
-  iterator in horton (there is none public today) would make the COPY
-  strictly one-table; the upsert absorbs the overlap for now.
+  refused, not handled. Range tombstones fail fast before the COPY;
+  point tombstones still surface at `archive_commit` time.
+- **True parallel drain needs horton's cooperation.** `sink_table`
+  takes `&self` and concurrent calls are safe (client mutex +
+  per-table staging names), but one `Db` still needs `&mut` for
+  `archive_commit`, so parallel sinking of a single database would
+  need interior mutability in horton itself.

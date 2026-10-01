@@ -5,12 +5,12 @@
 //! to the local unix socket as the current OS user:
 //! `host=/var/run/postgresql dbname=postgres`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use horton::{Config, Db};
-use horton_pg_sink::PgSink;
 use horton_pg_sink::device::MemDevice;
 use horton_pg_sink::mappers::HarvestEventMapper;
+use horton_pg_sink::{PgSink, SinkError};
 
 /// The two tests share one Postgres; serialize them.
 static PG_LOCK: Mutex<()> = Mutex::new(());
@@ -73,12 +73,13 @@ fn uuid_bytes(seed: u8) -> [u8; 16] {
 }
 
 /// 3 workflows x 60 events, flushed in 4 batches -> 4 sealed tables.
-async fn build_db() -> SinkDb {
+/// `wf_base` offsets the workflow ids so two dbs can share one target.
+async fn build_db(wf_base: u8) -> SinkDb {
     let mut db = SinkDb::new(MemDevice::new(), test_config());
     db.open().await.expect("open");
     let mut n = 0;
     for w in 0..3u8 {
-        let wf = uuid_bytes(w);
+        let wf = uuid_bytes(wf_base + w);
         for e in 0..60u32 {
             let (k, v) = HarvestEventMapper::encode(
                 &wf,
@@ -112,9 +113,9 @@ fn table_ids(db: &SinkDb) -> Vec<u32> {
 async fn archive_to_postgres_end_to_end() {
     let _guard = PG_LOCK.lock().unwrap();
     let target = target_for("e2e");
-    let mut sink = connect(&target).await;
+    let sink = connect(&target).await;
     let count_sql = format!("SELECT count(*) FROM {target}");
-    let mut db = build_db().await;
+    let mut db = build_db(0).await;
     let ids = table_ids(&db);
     assert!(!ids.is_empty(), "expected sealed tables in L0");
 
@@ -181,8 +182,8 @@ async fn archive_to_postgres_end_to_end() {
 async fn crash_between_pg_commit_and_archive_commit_replays_cleanly() {
     let _guard = PG_LOCK.lock().unwrap();
     let target = target_for("crash");
-    let mut sink = connect(&target).await;
-    let mut db = build_db().await;
+    let sink = connect(&target).await;
+    let mut db = build_db(0).await;
     let ids = table_ids(&db);
     let victim = ids[0];
 
@@ -215,4 +216,144 @@ async fn crash_between_pg_commit_and_archive_commit_replays_cleanly() {
         .expect("count")
         .get(0);
     assert_eq!(rows, 135, "only the 3 really-sunk tables landed");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the lock only serializes the PG tests
+async fn backpressure_lag_report_and_shed() {
+    let _guard = PG_LOCK.lock().unwrap();
+    let target = target_for("shed");
+    let mut sink = connect(&target).await;
+    let mut db = build_db(0).await;
+    let ids = table_ids(&db);
+    assert_eq!(ids.len(), 4);
+
+    // Backlog starts at 4 tables.
+    let lag = sink.lag_report(&db, 0).await.expect("lag");
+    assert_eq!(lag.tables.len(), 4);
+
+    // Threshold 2: sinking refuses with ShedLoad, table untouched.
+    sink.set_shed_threshold(Some(2));
+    let err = sink.sink_table(&mut db, 0, ids[0]).await.unwrap_err();
+    match err {
+        SinkError::ShedLoad { pending, threshold } => {
+            assert_eq!((pending, threshold), (4, 2));
+        }
+        other => panic!("expected ShedLoad, got {other:?}"),
+    }
+    assert!(
+        db.archive_plan(0, ids[0]).is_some(),
+        "shed table stays local"
+    );
+    let rows: i64 = sink
+        .client_query_one(&format!("SELECT count(*) FROM {target}"), &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 0, "nothing uploaded while shedding");
+
+    // Watermarked replays are cheap: they skip the shed check.
+    sink.client_exec(
+        "INSERT INTO horton_pg_sink_flushed (table_id, entries, max_seq) VALUES ($1, 45, 44)",
+        &[&(ids[0] as i32)],
+    )
+    .await
+    .expect("fake watermark");
+    let rep = sink.sink_table(&mut db, 0, ids[0]).await.expect("replay");
+    assert!(!rep.uploaded && rep.committed);
+
+    // Backlog shrank; disable shedding and drain normally.
+    let lag = sink.lag_report(&db, 0).await.expect("lag2");
+    assert_eq!(lag.tables.len(), 3);
+    sink.set_shed_threshold(None);
+    for id in ids.iter().skip(1) {
+        sink.sink_table(&mut db, 0, *id).await.expect("drain");
+    }
+    let lag = sink.lag_report(&db, 0).await.expect("lag3");
+    assert!(lag.is_empty(), "backlog drained");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the lock only serializes the PG tests
+async fn concurrent_sinks_share_one_sink() {
+    let _guard = PG_LOCK.lock().unwrap();
+    let target = target_for("concurrent");
+    let sink = Arc::new(connect(&target).await);
+    let db = build_db(0).await;
+    let ids = table_ids(&db);
+    assert_eq!(ids.len(), 4);
+
+    // The Db is !Send (no_alloc internals), so the concurrent tasks
+    // run on one thread via a LocalSet. Four tasks, one shared `&self`
+    // sink: the client mutex serializes the uploads and the per-table
+    // staging names keep them apart. The db moves into the LocalSet
+    // future (one copy — the Db is a hundred-KB stack value).
+    let local = tokio::task::LocalSet::new();
+    let total = local
+        .run_until(async {
+            let db = std::rc::Rc::new(tokio::sync::Mutex::new(db));
+            let mut handles = Vec::new();
+            for id in ids {
+                let (sink_c, db_c) = (Arc::clone(&sink), std::rc::Rc::clone(&db));
+                handles.push(tokio::task::spawn_local(async move {
+                    let mut g = db_c.lock().await;
+                    sink_c.sink_table(&mut g, 0, id).await
+                }));
+            }
+            let mut total = 0u64;
+            for h in handles {
+                let rep = h.await.expect("task panicked").expect("sink");
+                assert!(rep.uploaded && rep.committed);
+                total += rep.entries_copied;
+            }
+            total
+        })
+        .await;
+    assert_eq!(total, 180);
+    let rows: i64 = sink
+        .client_query_one(&format!("SELECT count(*) FROM {target}"), &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 180, "concurrent uploads landed exactly once");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the lock only serializes the PG tests
+async fn range_tombstone_table_fails_fast() {
+    let _guard = PG_LOCK.lock().unwrap();
+    let target = target_for("tombstone");
+    let sink = connect(&target).await;
+    let mut db = SinkDb::new(MemDevice::new(), test_config());
+    db.open().await.expect("open");
+    let wf = uuid_bytes(0);
+    let mut first = Vec::new();
+    let mut last = Vec::new();
+    for e in 0..10u32 {
+        let (k, v) = HarvestEventMapper::encode(&wf, e, "T", "2026-09-30T12:00:00Z", "{}").unwrap();
+        if e == 0 {
+            first = k.clone();
+        }
+        last = k.clone();
+        db.put(&k, &v).await.expect("put");
+    }
+    db.delete_range(&first, &last).await.expect("delete_range");
+    db.flush().await.expect("flush");
+    let ids = table_ids(&db);
+    assert_eq!(ids.len(), 1);
+
+    // The sealed table carries range-tombstone blocks: the sink must
+    // refuse before burning a COPY, and leave the table local.
+    let err = sink.sink_table(&mut db, 0, ids[0]).await.unwrap_err();
+    assert!(
+        matches!(err, SinkError::TombstonesWouldResurrect { .. }),
+        "got {err:?}"
+    );
+    assert!(db.archive_plan(0, ids[0]).is_some(), "table stays local");
+    let rows: i64 = sink
+        .client_query_one(&format!("SELECT count(*) FROM {target}"), &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 0, "nothing uploaded for tombstoned table");
 }
