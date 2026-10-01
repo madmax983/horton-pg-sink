@@ -57,6 +57,7 @@ use tokio_postgres::types::ToSql;
 
 use horton::{BlockDevice, Db, Scan};
 
+pub mod cold;
 pub mod device;
 pub mod mappers;
 
@@ -102,6 +103,7 @@ mod escape {
     }
 }
 
+pub use cold::PgTableSink;
 pub use escape::{copy_escape, exclusive_end};
 
 /// Maps one horton entry to a Postgres row.
@@ -139,6 +141,11 @@ pub enum SinkError {
     ShedLoad { pending: usize, threshold: usize },
     /// The mapper rejected an entry.
     Map(String),
+    /// A cold-sink protocol violation: overlong or short block stream,
+    /// commit without an open seal, a re-seal whose descriptor disagrees
+    /// with the stored row, or a local setup failure (e.g. the sink's
+    /// internal runtime could not start).
+    Protocol(String),
     /// A horton operation failed.
     Horton(String),
     /// A Postgres operation failed.
@@ -163,6 +170,7 @@ impl core::fmt::Display for SinkError {
                 "shed load: {pending} tables waiting (threshold {threshold}); write straight to Postgres"
             ),
             Self::Map(msg) => write!(f, "row mapping failed: {msg}"),
+            Self::Protocol(msg) => write!(f, "sink protocol violation: {msg}"),
             Self::Horton(msg) => write!(f, "horton error: {msg}"),
             Self::Postgres(e) => write!(f, "postgres error: {e}"),
         }

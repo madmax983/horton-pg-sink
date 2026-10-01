@@ -1,10 +1,20 @@
 # horton-pg-sink
 
 Postgres sink for horton's [archive API](https://github.com/madmax983/horton)
-(`archive_plan` / `archive_commit`). The motivating deployment is the
-Harvest event tail: horton absorbs a write storm as a durable LSM buffer,
-and this sink drains sealed tables into Postgres with batched `COPY`.
-Postgres remains the source of truth; horton is a write accelerator.
+(`archive_plan` / `archive_commit`). Two sinks live here — pick one:
+
+- **`PgSink`** — drains a table's *entries* into Postgres *rows* via
+  batched `COPY` (Postgres becomes the queryable source of truth). The
+  motivating deployment is the Harvest event tail: horton absorbs a
+  write storm as a durable LSM buffer. Insert-only workloads.
+- **`PgTableSink`** — implements
+  [`ColdSink`](https://github.com/madmax983/horton-sweeper) from the
+  `horton-sweeper` crate: stores the table's *immutable bytes* plus its
+  descriptor in one `horton_cold_tables` row (`BYTEA` blob, CRC-64
+  verified at commit, idempotent per table id). Byte-exact `read_table`
+  for the sweeper's cold-read path and replica bootstrap. Any workload;
+  tombstones are simply stored as bytes (the sweeper + `archive_commit`
+  own the tombstone policy).
 
 ## The tier story
 
@@ -75,6 +85,32 @@ arms load shedding: when the backlog reaches `n`, `sink_table`
 returns `SinkError::ShedLoad` instead of sinking, so the caller can
 route writes straight to Postgres until the backlog drains.
 Watermarked replays are cheap and never shed.
+
+## PgTableSink protocol (byte-preserving cold sink)
+
+One `horton_cold_tables` row per sealed table: descriptor columns
+(`level`, `min_seq`/`max_seq`, `block_count`, `entry_count`,
+`node_id`, `seal_wall_clock`) plus `bytes`, `checksum` (CRC-64), and
+the `data` blob.
+
+1. `seal(descriptor)` — if the row exists with an identical
+   descriptor, returns a complete handle (idempotent re-seal); if it
+   exists with a *different* descriptor, errors (table ids are never
+   reused, so that is corruption, not a retry).
+2. `write_block` — appends to an in-memory staging buffer, updating a
+   running CRC-64; overlong streams are rejected.
+3. `commit` — refuses short streams, verifies the checksum, then
+   `INSERT ... ON CONFLICT (table_id) DO NOTHING` and re-reads the row
+   to confirm descriptor + checksum before issuing the `Receipt`.
+4. `read_table` / `list_archived` — byte-exact blobs for the cold-read
+   path and replica bootstrap.
+
+The trait is synchronous (the sweeper is a sync policy loop); the sink
+owns a private single-worker tokio runtime and drives every statement
+through it. Don't call it from inside another tokio runtime context.
+Crash-retry is the same story as `PgSink`: a crash anywhere before
+`archive_commit` replays the upload, and the committed-row check makes
+the replay a no-op.
 
 ## Honest gaps
 

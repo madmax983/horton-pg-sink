@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 horton = { path = "../horton" }
+horton-sweeper = { path = "../horton-sweeper" }
 tokio-postgres = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

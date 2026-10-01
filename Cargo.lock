@@ -199,8 +199,16 @@ dependencies = [
  "bytes",
  "futures-util",
  "horton",
+ "horton-sweeper",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "horton-sweeper"
+version = "0.1.0"
+dependencies = [
+ "horton",
 ]
 
 [[package]]
